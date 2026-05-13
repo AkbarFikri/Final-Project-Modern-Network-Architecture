@@ -6,6 +6,16 @@ This serves as the real-scale scenario (T3) representing modern data center
 architecture with multiple equal-cost paths across spine-leaf fabric.
 
 Switch naming: s1-s4 = spines, s5-s8 = leafs (consistent with other topologies)
+Host IP: Flat /24 subnet (10.0.0.0/24) for simple inter-leaf routing via ECMP
+Inter-leaf traffic: Automatically routed through controller (multipath ECMP)
+
+Host allocation:
+    - h1-h2 connected to leaf s5
+    - h3-h4 connected to leaf s6
+    - h5-h6 connected to leaf s7
+    - h7-h8 connected to leaf s8
+    All with IPs: 10.0.0.1/24 through 10.0.0.8/24
+
 
 ASCII art (simplified):
 
@@ -61,14 +71,16 @@ class ClosTopo(Topo):
     """Spine-Leaf Clos topology (k=4) with 8 switches, 8 hosts.
     
     Naming convention: s1-s4 = spine switches, s5-s8 = leaf switches.
+    All hosts on flat 10.0.0.0/24 subnet for simple inter-leaf routing.
     Provides 4 equal-cost paths via different spines for inter-leaf communication.
     
     Characteristics:
         - 4 spine switches (s1-s4) in aggregation layer
         - 4 leaf switches (s5-s8) in access layer
-        - 8 hosts (2 per leaf)
+        - 8 hosts (2 per leaf) on flat 10.0.0.0/24 subnet
         - Full mesh between leaves via spines (4 equal-cost paths)
         - Modern data center architecture pattern
+        - All inter-leaf traffic routed via controller (multipath ECMP)
     """
 
     def addSwitch(self, name, **opts):
@@ -80,15 +92,15 @@ class ClosTopo(Topo):
         Topo.__init__(self)
 
         info("*** Adding hosts\n")
-        # Host distribution: 2 hosts per leaf
-        h1 = self.addHost("h1", ip="10.0.1.1/24")
-        h2 = self.addHost("h2", ip="10.0.1.2/24")
-        h3 = self.addHost("h3", ip="10.0.2.1/24")
-        h4 = self.addHost("h4", ip="10.0.2.2/24")
-        h5 = self.addHost("h5", ip="10.0.3.1/24")
-        h6 = self.addHost("h6", ip="10.0.3.2/24")
-        h7 = self.addHost("h7", ip="10.0.4.1/24")
-        h8 = self.addHost("h8", ip="10.0.4.2/24")
+        # Host distribution: 2 hosts per leaf (flat /24 subnet)
+        h1 = self.addHost("h1", ip="10.0.0.1/24")
+        h2 = self.addHost("h2", ip="10.0.0.2/24")
+        h3 = self.addHost("h3", ip="10.0.0.3/24")
+        h4 = self.addHost("h4", ip="10.0.0.4/24")
+        h5 = self.addHost("h5", ip="10.0.0.5/24")
+        h6 = self.addHost("h6", ip="10.0.0.6/24")
+        h7 = self.addHost("h7", ip="10.0.0.7/24")
+        h8 = self.addHost("h8", ip="10.0.0.8/24")
 
         info("*** Adding spine switches\n")
         s1 = self.addSwitch("s1")
@@ -170,6 +182,7 @@ def run():
     dumpNodeConnections(net.hosts)
     info("\n*** Network is running. Type 'exit' to quit.\n")
     info("*** Clos spine-leaf topology with 4 equal-cost paths between leaves.\n")
+    info("*** All hosts on flat 10.0.0.0/24 subnet.\n")
     CLI(net)
     net.stop()
 
