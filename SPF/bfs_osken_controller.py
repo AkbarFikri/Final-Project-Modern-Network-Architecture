@@ -53,6 +53,12 @@ class BFSSwitch(SPFBaseController):
 
     FLOW_COOKIE = BFS_FLOW_COOKIE
 
+    def __init__(self, *args, **kwargs):
+        super(BFSSwitch, self).__init__(*args, **kwargs)
+        # Enable metrics collection for BFS single-path
+        if not self.metrics_enabled:
+            self.enable_metrics(algorithm_name="bfs", multipath=False, output_dir="metrics")
+
     def compute_path(self, src, dst, first_port, final_port):
         """Compute shortest hop-count path using BFS.
 

@@ -53,6 +53,10 @@ class AStarMultipathSwitch(AStarSwitch):
         super(AStarMultipathSwitch, self).__init__(*args, **kwargs)
         self.path_cache = {}     # (src, dst, k) -> [node_path, ...]
         self.flow_groups = {}    # (src_mac, dst_mac) -> (ingress_dpid, group_id)
+        self.flow_path_count = {}  # (src_mac, dst_mac) -> number of paths
+        # Update metrics to multipath=True (parent already initialized)
+        if self.metrics_collector:
+            self.metrics_collector.set_multipath_enabled(True)
 
     # ─────────────────────────────────────────────────────────────────────────
     # ECMP group management (same as DijkstraMultipathSwitch)
@@ -230,6 +234,7 @@ class AStarMultipathSwitch(AStarSwitch):
         group_id = self._alloc_group_id(src_mac, dst_mac)
         if self._install_select_group(ingress_dp, group_id, ingress_out_ports):
             self.flow_groups[key] = (ingress_dpid, group_id)
+            self.flow_path_count[key] = len(paths)  # Track number of paths
             self._install_group_flow(ingress_dp, ingress_in_port, src_mac, dst_mac, group_id)
             self.logger.info("[ECMP-INSTALL] %s->%s paths=%d ingress=s%d group=%d",
                              src_mac, dst_mac, len(paths), ingress_dpid, group_id)
@@ -252,6 +257,7 @@ class AStarMultipathSwitch(AStarSwitch):
         self.installed_paths.clear()
         self.path_cache.clear()
         self.flow_groups.clear()
+        self.flow_path_count.clear()
 
     def _reinstall_all_known_routes(self):
         hosts = self._active_hosts()

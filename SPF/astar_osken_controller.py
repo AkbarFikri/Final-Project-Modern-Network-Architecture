@@ -46,6 +46,9 @@ class AStarSwitch(SPFBaseController):
         # Cache: dst -> {node: hop_distance_to_dst}
         # Invalidated whenever the topology changes.
         self.heuristic_hop_cache = {}
+        # Enable metrics collection for A* single-path
+        if not self.metrics_enabled:
+            self.enable_metrics(algorithm_name="astar", multipath=False, output_dir="metrics")
 
     def _on_topology_changed(self):
         """Clear heuristic cache so stale hop-distances are not reused."""

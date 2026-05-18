@@ -37,7 +37,9 @@ except ImportError:
 import sys
 import signal
 import time
+from datetime import datetime
 from collections import defaultdict, deque
+import threading
 
 from os_ken.base import app_manager
 from os_ken.controller import ofp_event
@@ -47,6 +49,14 @@ from os_ken.ofproto import ofproto_v1_3
 from os_ken.lib.packet import packet, ethernet, ether_types
 from os_ken.topology.api import get_switch, get_link
 from os_ken.topology import event
+
+
+# Metrics collection (optional)
+try:
+    from metrics import MetricsCollector, AsyncFlowStatsCollector
+    HAS_METRICS = True
+except ImportError:
+    HAS_METRICS = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -118,6 +128,16 @@ class SPFBaseController(app_manager.OSKenApp):
         self.broadcast_tree: dict = {}
         # Access ports: dpid → {port_no, ...}  (ports connected to hosts)
         self.access_ports: defaultdict = defaultdict(set)
+        
+        # Metrics collection (optional)
+        self.metrics_collector = None
+        self.metrics_enabled = False
+        self.flow_stats_cache = {}  # (dpid, eth_src, eth_dst) -> stats
+        
+        # Periodic flow stats polling
+        self.stats_poll_thread = None
+        self.stats_poll_interval = 5  # seconds
+        self.stats_poll_active = False
 
     # ──────────────────────────────────────────────────────────────────────────
     # Abstract interface — override in subclasses
@@ -147,6 +167,210 @@ class SPFBaseController(app_manager.OSKenApp):
         structures (e.g., Floyd-Warshall) before route reinstallation.
         """
         pass
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Metrics collection (optional)
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def enable_metrics(self, algorithm_name=None, multipath=False, output_dir="metrics"):
+        """
+        Enable metrics collection for this controller.
+
+        Args:
+            algorithm_name: Name of routing algorithm (auto-detected if None)
+            multipath: Whether multipath forwarding is enabled
+            output_dir: Directory to save CSV files
+        """
+        if not HAS_METRICS:
+            self.logger.warning("[METRICS] metrics module not available")
+            return False
+        
+        if algorithm_name is None:
+            algorithm_name = self.__class__.__name__
+        
+        self.metrics_collector = MetricsCollector(
+            controller=self,
+            output_dir=output_dir,
+            algorithm_name=algorithm_name
+        )
+        self.metrics_collector.set_multipath_enabled(multipath)
+        self.metrics_enabled = True
+        
+        # Start periodic flow stats polling
+        self._start_stats_polling()
+        
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.logger.info(f"[{timestamp}] [METRICS] Enabled for {algorithm_name} (multipath={multipath})")
+        return True
+
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def _flow_stats_reply_handler(self, ev):
+        """Handle flow statistics reply from switches."""
+        if not self.metrics_enabled:
+            return
+        
+        body = ev.msg.body
+        dpid = ev.msg.datapath.id
+        flow_count = 0
+        
+        for stat in body:
+            try:
+                match = stat.match
+                eth_src = match.get('eth_src')
+                eth_dst = match.get('eth_dst')
+                
+                if eth_src and eth_dst:
+                    key = (dpid, eth_src, eth_dst)
+                    self.flow_stats_cache[key] = {
+                        'packets': stat.packet_count,
+                        'bytes': stat.byte_count,
+                        'duration_sec': stat.duration_sec
+                    }
+                    flow_count += 1
+            except Exception as e:
+                self.logger.debug(f"[FLOW-STATS-PARSE] {e}")
+        
+        if flow_count > 0:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self.logger.info(f"[{timestamp}] [STATS-REPLY] s{dpid}: received stats for {flow_count} flows")
+
+    def request_flow_stats(self):
+        """Request flow statistics from all connected switches."""
+        if not self.metrics_enabled:
+            return
+        
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.logger.info(f"[{timestamp}] [STATS-REQ] Requesting stats from {len(self.datapaths)} switch(es)")
+        
+        for dpid, datapath in self.datapaths.items():
+            try:
+                ofproto = datapath.ofproto
+                parser = datapath.ofproto_parser
+                
+                req = parser.OFPFlowStatsRequest(
+                    datapath=datapath,
+                    table_id=ofproto.OFPTT_ALL,
+                    out_port=ofproto.OFPP_ANY,
+                    out_group=ofproto.OFPG_ANY
+                )
+                datapath.send_msg(req)
+            except Exception as e:
+                self.logger.debug(f"[STATS-REQ-ERROR] s{dpid}: {e}")
+
+    def get_flow_stats_for_pair(self, src_mac, dst_mac):
+        """
+        Get aggregated flow statistics for a MAC pair.
+
+        Returns:
+            Dict with 'total_packets', 'total_bytes', 'active_switches'
+        """
+        result = {
+            'total_packets': 0,
+            'total_bytes': 0,
+            'active_switches': 0,
+            'per_switch': {}
+        }
+        
+        for (dpid, src, dst), stats in self.flow_stats_cache.items():
+            if src == src_mac and dst == dst_mac:
+                result['total_packets'] += stats['packets']
+                result['total_bytes'] += stats['bytes']
+                result['per_switch'][dpid] = stats
+                if stats['packets'] > 0:
+                    result['active_switches'] += 1
+        
+        return result
+
+    def save_metrics_snapshot(self):
+        """Save current metrics snapshot to CSV (called at shutdown)."""
+        if not self.metrics_enabled or not self.metrics_collector:
+            return
+        
+        # Collect metrics for all active host pairs
+        flows_data = []
+        for (src_mac, dst_mac), path in self.installed_paths.items():
+            if path:
+                src_dpid = path[0][0]
+                dst_dpid = path[-1][0]
+                
+                # Get flow stats
+                stats = self.get_flow_stats_for_pair(src_mac, dst_mac)
+                
+                # Count active paths from flow_path_count (multipath) or default to 1
+                active_paths = 1
+                if hasattr(self, 'flow_path_count') and (src_mac, dst_mac) in self.flow_path_count:
+                    active_paths = self.flow_path_count[(src_mac, dst_mac)]
+                
+                # Generate flow_id from MAC addresses
+                flow_id = f"{src_mac.split(':')[-1]}-{dst_mac.split(':')[-1]}"
+                
+                metrics = {
+                    'timestamp': datetime.now().isoformat(),
+                    'flow_id': flow_id,
+                    'src_mac': src_mac,
+                    'dst_mac': dst_mac,
+                    'src_dpid': src_dpid,
+                    'dst_dpid': dst_dpid,
+                    'src_host': '',  # Empty - not available in shutdown context
+                    'dst_host': '',  # Empty - not available in shutdown context
+                    'throughput_mbps': 0.0,  # Will be 0 since no iperf in test
+                    'latency_ms': 0.0,
+                    'jains_fairness_index': self.metrics_collector.calculate_jains_fairness_index(
+                        [stats['total_bytes']] if stats['total_bytes'] > 0 else [1]
+                    ) or 0.0,
+                    'active_paths': active_paths,
+                    'total_packets': stats['total_packets'],
+                    'total_bytes': stats['total_bytes'],
+                    'algorithm': self.metrics_collector.algorithm,
+                    'multipath_enabled': self.metrics_collector.multipath_enabled
+                }
+                flows_data.append(metrics)
+        
+        if flows_data:
+            self.metrics_collector.save_metrics_to_csv(flows_data, self.metrics_collector.multipath_enabled)
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self.logger.info(f"[{timestamp}] [METRICS] Saved {len(flows_data)} flows to CSV")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Periodic flow statistics polling
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _start_stats_polling(self):
+        """Start periodic flow statistics polling thread."""
+        if not self.metrics_enabled:
+            return
+        
+        self.stats_poll_active = True
+        self.stats_poll_thread = threading.Thread(
+            target=self._stats_polling_worker,
+            daemon=True
+        )
+        self.stats_poll_thread.start()
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.logger.info(f"[{timestamp}] [STATS-POLL] Started periodic polling (interval={self.stats_poll_interval}s)")
+
+    def _stop_stats_polling(self):
+        """Stop periodic flow statistics polling."""
+        if not self.stats_poll_active:
+            return
+        
+        self.stats_poll_active = False
+        if self.stats_poll_thread:
+            self.stats_poll_thread.join(timeout=2)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.logger.info(f"[{timestamp}] [STATS-POLL] Stopped periodic polling")
+
+    def _stats_polling_worker(self):
+        """Worker thread that periodically requests flow stats from switches."""
+        while self.stats_poll_active:
+            try:
+                time.sleep(self.stats_poll_interval)
+                if self.stats_poll_active and self.datapaths:
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    self.logger.info(f"[{timestamp}] [STATS-POLL] Polling {len(self.datapaths)} switch(es)")
+                    self.request_flow_stats()
+            except Exception as e:
+                self.logger.debug(f"[STATS-POLL-ERROR] {e}")
 
     # ──────────────────────────────────────────────────────────────────────────
     # Path reconstruction helper (shared by single-path algorithm subclasses)
@@ -601,8 +825,13 @@ class SPFBaseController(app_manager.OSKenApp):
 
     def stop(self):
         """Clean shutdown: purge all installed flows and clear state."""
-        self.logger.info("[CONTROLLER-STOP] clearing %d hosts, %d paths",
-                         len(self.mymacs), len(self.installed_paths))
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.logger.info(f"[{timestamp}] [CONTROLLER-STOP] clearing {len(self.mymacs)} hosts, {len(self.installed_paths)} paths")
+        
+        # Stop periodic polling and save metrics
+        self._stop_stats_polling()
+        self.save_metrics_snapshot()
+        
         self._flush_all_flows()
         self.mymacs.clear()
         self.host_last_seen.clear()
@@ -610,5 +839,6 @@ class SPFBaseController(app_manager.OSKenApp):
         self.broadcast_tree.clear()
         self.datapaths.clear()
         super(SPFBaseController, self).stop()
-        self.logger.info("[CONTROLLER-EXIT] graceful exit complete")
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.logger.info(f"[{timestamp}] [CONTROLLER-EXIT] graceful exit complete")
         sys.exit(0)

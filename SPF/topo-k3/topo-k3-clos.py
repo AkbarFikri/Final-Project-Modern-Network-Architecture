@@ -116,17 +116,17 @@ class ClosTopo(Topo):
 
         info("*** Adding host-to-leaf links\n")
         # Leaf s5
-        self.addLink(s5, h1, port1=1, port2=1)
-        self.addLink(s5, h2, port1=2, port2=1)
+        self.addLink(s5, h1, port1=1, port2=1, delay='5ms',)
+        self.addLink(s5, h2, port1=2, port2=1, delay='5ms',)
         # Leaf s6
-        self.addLink(s6, h3, port1=1, port2=1)
-        self.addLink(s6, h4, port1=2, port2=1)
+        self.addLink(s6, h3, port1=1, port2=1, delay='5ms',)
+        self.addLink(s6, h4, port1=2, port2=1, delay='5ms',)
         # Leaf s7
-        self.addLink(s7, h5, port1=1, port2=1)
-        self.addLink(s7, h6, port1=2, port2=1)
+        self.addLink(s7, h5, port1=1, port2=1, delay='5ms',)
+        self.addLink(s7, h6, port1=2, port2=1, delay='5ms',)
         # Leaf s8
-        self.addLink(s8, h7, port1=1, port2=1)
-        self.addLink(s8, h8, port1=2, port2=1)
+        self.addLink(s8, h7, port1=1, port2=1, delay='5ms',)
+        self.addLink(s8, h8, port1=2, port2=1, delay='5ms',)
 
         info("*** Adding spine-to-leaf links (full mesh)\n")
         # Leaf s5 to all spines

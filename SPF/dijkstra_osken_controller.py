@@ -41,6 +41,12 @@ class DijkstraSwitch(SPFBaseController):
 
     FLOW_COOKIE = SPF_FLOW_COOKIE
 
+    def __init__(self, *args, **kwargs):
+        super(DijkstraSwitch, self).__init__(*args, **kwargs)
+        # Enable metrics collection for Dijkstra single-path
+        if not self.metrics_enabled:
+            self.enable_metrics(algorithm_name="dijkstra", multipath=False, output_dir="metrics")
+
     def compute_path(self, src, dst, first_port, final_port):
         """Compute shortest path using Dijkstra's algorithm.
 

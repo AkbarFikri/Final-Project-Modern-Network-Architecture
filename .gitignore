@@ -25,3 +25,7 @@ docs/
 *.swo
 *~
 AGENT*.md
+
+metrics/
+logs/
+plots/
