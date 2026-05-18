@@ -166,8 +166,7 @@ Wait for all hosts to be discovered. You should see:
 cd /workspaces/learn_sdn/logs
 
 # Capture with timestamp
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-sudo tcpdump -i any -w tcpdump_test1_${TIMESTAMP}.pcap -G 120 &
+sudo tcpdump -i any -w "tcpdump_test1_%Y%m%d_%H%M%S.pcap" -Z root -G 120 &
 
 # Note: -G 120 rotates file every 120 seconds
 ```
