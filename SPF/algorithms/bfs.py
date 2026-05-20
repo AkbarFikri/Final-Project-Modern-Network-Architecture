@@ -14,7 +14,7 @@ Comparison with Dijkstra:
     On unweighted graphs BFS is faster in practice (no heap overhead).
 """
 
-from collections import deque
+from collections import deque, defaultdict
 
 
 def bfs(adjacency, src, weights=None):
@@ -58,3 +58,56 @@ def bfs(adjacency, src, weights=None):
                 queue.append(v)                     # enqueue for later expansion
 
     return distance, previous
+
+
+def bfs_multi_parent(adjacency, src, weights=None):
+    """BFS variant that keeps ALL equal-cost predecessors per node.
+
+    Used by multipath controllers to enumerate all equal-cost paths for
+    ECMP load balancing. Since BFS explores nodes level by level, any
+    predecessor found at the same distance is an equal-cost path.
+
+    Args:
+        adjacency: dict  {node: [(neighbor, out_port), ...]}
+        weights:   ignored — BFS always uses unit edge costs.
+
+    Returns:
+        (distance, parents)
+        distance[v] = minimum hop count from src to v  (inf if unreachable)
+        parents[v]  = set of nodes u where dist[u] + 1 == dist[v]
+    """
+    # --- Phase 1: Initialise distances for every known vertex ---
+    distance = {}
+    parents = defaultdict(set)
+
+    for node in adjacency:
+        distance[node] = float("inf")
+        for neighbor, _ in adjacency[node]:
+            distance.setdefault(neighbor, float("inf"))
+
+    if src not in distance:
+        return distance, parents
+
+    # --- Phase 2: BFS from source, collecting all equal-cost parents ---
+    distance[src] = 0
+    queue = deque([src])
+    visited = {src}
+
+    while queue:
+        u = queue.popleft()
+
+        for v, _ in adjacency.get(u, []):
+            alt = distance[u] + 1
+
+            if alt < distance[v]:
+                # Strictly better path found — replace parent set
+                distance[v] = alt
+                parents[v] = {u}
+                if v not in visited:
+                    queue.append(v)
+                    visited.add(v)
+            elif alt == distance[v] and u not in parents[v]:
+                # Equal-cost path found — add to parent set
+                parents[v].add(u)
+
+    return distance, parents
