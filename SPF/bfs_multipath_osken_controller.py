@@ -348,6 +348,19 @@ class BFSMultipathSwitch(BFSSwitch):
                     actions=[parser.OFPActionOutput(out_port)],
                     data=data,
                 ))
+        else:
+            self.logger.debug(
+                "[PKT-FLOOD] %s->%s: dst unknown, flooding",
+                src,
+                dst
+            )
+
+            self._flood_over_tree(
+                dp,
+                in_port,
+                msg.data,
+                msg.buffer_id
+            )
 
 
 if __name__ == '__main__':
