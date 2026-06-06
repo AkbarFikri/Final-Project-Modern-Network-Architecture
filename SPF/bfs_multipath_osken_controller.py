@@ -57,7 +57,7 @@ class BFSMultipathSwitch(BFSSwitch):
         self.path_cache = {}           # (src, dst, k) -> [node_path, ...]
         self.flow_groups = {}          # (src_mac, dst_mac) -> (ingress_dpid, group_id)
         self.flow_path_count = {}      # (src_mac, dst_mac) -> number of paths
-        # Update metrics to multipath=True (parent already initialized)
+        # Enable metrics collection for multipath (parent __init__ already calls it)
         if self.metrics_collector:
             self.metrics_collector.set_multipath_enabled(True)
 

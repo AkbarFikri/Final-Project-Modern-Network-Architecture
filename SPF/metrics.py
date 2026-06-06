@@ -48,12 +48,80 @@ class MetricsCollector:
         # Flow statistics cache: (switch_dpid, flow_id) -> (packet_count, byte_count)
         self.flow_stats_cache = {}
         
+        # Algorithm timing: (src_mac, dst_mac) -> calculation_time_ms
+        self.algorithm_times = {}
+        
+        # Per-link traffic: (src_dpid, dst_dpid, out_port) -> bytes
+        self.link_traffic = defaultdict(int)
+        
+        # Multi-run support: List to accumulate metrics across runs
+        self.run_metrics = []  # List of metric dictionaries from each run
+        
         # Timestamp for duration calculation
         self.start_time = time.time()
 
     def set_multipath_enabled(self, enabled):
         """Set whether multipath forwarding is enabled."""
         self.multipath_enabled = enabled
+    
+    def record_algorithm_time(self, src_mac, dst_mac, calculation_time_ms):
+        """Record algorithm calculation time for a flow.
+        
+        Args:
+            src_mac: Source MAC address
+            dst_mac: Destination MAC address
+            calculation_time_ms: Time in milliseconds
+        """
+        key = (src_mac, dst_mac)
+        self.algorithm_times[key] = calculation_time_ms
+        self.logger.debug(f"[ALGO-TIME] {src_mac} -> {dst_mac}: {calculation_time_ms:.3f} ms")
+    
+    def get_algorithm_time(self, src_mac, dst_mac):
+        """Get recorded algorithm time for a flow."""
+        key = (src_mac, dst_mac)
+        return self.algorithm_times.get(key, 0.0)
+    
+    def record_link_traffic(self, src_dpid, dst_dpid, out_port, byte_count):
+        """Record traffic on a specific link.
+        
+        Args:
+            src_dpid: Source switch DPID
+            dst_dpid: Destination switch DPID
+            out_port: Outgoing port number on src_dpid
+            byte_count: Number of bytes transferred
+        """
+        link_key = (src_dpid, dst_dpid, out_port)
+        self.link_traffic[link_key] += byte_count
+        self.logger.debug(f"[LINK-TRAFFIC] s{src_dpid} -> s{dst_dpid} (port {out_port}): {byte_count} bytes")
+    
+    def get_link_traffic_summary(self):
+        """Get summary of per-link traffic from controller.
+        
+        Returns:
+            Dict of {(src_dpid, out_port, dst_dpid): total_bytes}
+        """
+        if not self.controller:
+            return {}
+        
+        # Get link traffic directly from controller
+        return dict(self.controller.link_traffic) if hasattr(self.controller, 'link_traffic') else {}
+    
+    def reset_link_traffic(self):
+        """Reset per-link traffic counters in controller."""
+        if self.controller and hasattr(self.controller, 'link_traffic'):
+            self.controller.link_traffic.clear()
+            self.logger.info("[LINK-RESET] Per-link traffic counters cleared")
+    
+    def save_run_metrics(self, metrics_dict, run_number=None):
+        """Save metrics from a single test run.
+        
+        Args:
+            metrics_dict: Metrics from one run
+            run_number: Run number for tracking
+        """
+        if run_number is not None:
+            metrics_dict['run_number'] = run_number
+        self.run_metrics.append(metrics_dict)
 
     # ──────────────────────────────────────────────────────────────────────────
     # 1. THROUGHPUT MEASUREMENT (iperf3)
@@ -500,6 +568,149 @@ class MetricsCollector:
         print(f"  Avg Latency:              {sum(latencies)/len(latencies):.2f} ms")
         print(f"  Avg Fairness Index:       {sum(jfis)/len(jfis):.4f}")
         print("="*80 + "\n")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # ALGORITHM TIMING AND LINK TRAFFIC EXPORT
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def save_algorithm_times_to_csv(self):
+        """Save algorithm calculation times to CSV.
+        
+        Returns:
+            Path to saved CSV file
+        """
+        if not self.algorithm_times:
+            self.logger.warning("[ALGO-CSV] No algorithm times to save")
+            return None
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"algo_times_{self.algorithm}_{timestamp}.csv"
+        filepath = self.output_dir / filename
+        
+        fieldnames = ['src_mac', 'dst_mac', 'calculation_time_ms', 'algorithm', 'multipath_enabled']
+        
+        try:
+            with open(filepath, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                for (src_mac, dst_mac), calc_time in self.algorithm_times.items():
+                    writer.writerow({
+                        'src_mac': src_mac,
+                        'dst_mac': dst_mac,
+                        'calculation_time_ms': f"{calc_time:.3f}",
+                        'algorithm': self.algorithm,
+                        'multipath_enabled': self.multipath_enabled
+                    })
+            
+            self.logger.info(f"[ALGO-CSV] Algorithm times saved to {filepath}")
+            return filepath
+            
+        except Exception as e:
+            self.logger.error(f"[ALGO-CSV-ERROR] {e}")
+            return None
+
+    def save_link_traffic_to_csv(self, run_number=None):
+        """Save per-link traffic distribution to CSV.
+        
+        Extracts link traffic from the controller's actual flow statistics.
+        
+        Args:
+            run_number: Optional run number for multi-run tracking
+        
+        Returns:
+            Path to saved CSV file
+        """
+        link_traffic = self.get_link_traffic_summary()
+        
+        if not link_traffic:
+            self.logger.warning("[LINK-CSV] No link traffic data to save")
+            return None
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"link_traffic_{self.algorithm}_{timestamp}.csv"
+        filepath = self.output_dir / filename
+        
+        # Determine fieldnames based on actual link data structure
+        fieldnames = ['run_number', 'src_switch', 'out_port', 'dst_switch', 
+                      'total_bytes', 'algorithm', 'multipath_enabled']
+        
+        try:
+            with open(filepath, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                for (src_dpid, out_port, dst_dpid), byte_count in link_traffic.items():
+                    writer.writerow({
+                        'run_number': run_number or 'N/A',
+                        'src_switch': f"s{src_dpid}",
+                        'out_port': out_port,
+                        'dst_switch': f"s{dst_dpid}" if dst_dpid else "host",
+                        'total_bytes': byte_count,
+                        'algorithm': self.algorithm,
+                        'multipath_enabled': self.multipath_enabled
+                    })
+            
+            self.logger.info(f"[LINK-CSV] Link traffic saved to {filepath} ({len(link_traffic)} links)")
+            return filepath
+            
+        except Exception as e:
+            self.logger.error(f"[LINK-CSV-ERROR] {e}")
+            return None
+
+    def save_multi_run_summary(self, output_filename=None):
+        """Save summary of metrics from multiple runs with averages.
+        
+        Args:
+            output_filename: Optional custom output filename
+        
+        Returns:
+            Path to saved CSV file
+        """
+        if not self.run_metrics:
+            self.logger.warning("[MULTI-RUN] No run metrics to save")
+            return None
+        
+        if output_filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_filename = f"multi_run_summary_{self.algorithm}_{timestamp}.csv"
+        
+        filepath = self.output_dir / output_filename
+        
+        fieldnames = ['run_number', 'throughput_mbps', 'latency_ms', 'jains_fairness_index', 
+                      'active_paths', 'algorithm', 'multipath_enabled']
+        
+        try:
+            with open(filepath, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                
+                for metrics in self.run_metrics:
+                    row = {field: metrics.get(field, '') for field in fieldnames}
+                    row['algorithm'] = self.algorithm
+                    row['multipath_enabled'] = self.multipath_enabled
+                    writer.writerow(row)
+            
+            # Calculate and log averages
+            if self.run_metrics:
+                throughputs = [m.get('throughput_mbps', 0) for m in self.run_metrics]
+                latencies = [m.get('latency_ms', 0) for m in self.run_metrics]
+                jfis = [m.get('jains_fairness_index', 0) for m in self.run_metrics]
+                
+                avg_throughput = sum(throughputs) / len(throughputs) if throughputs else 0
+                avg_latency = sum(latencies) / len(latencies) if latencies else 0
+                avg_jfi = sum(jfis) / len(jfis) if jfis else 0
+                
+                self.logger.info(f"[MULTI-RUN] Summary saved to {filepath}")
+                self.logger.info(f"[MULTI-RUN] Avg Throughput: {avg_throughput:.2f} Mbps")
+                self.logger.info(f"[MULTI-RUN] Avg Latency: {avg_latency:.2f} ms")
+                self.logger.info(f"[MULTI-RUN] Avg Fairness Index: {avg_jfi:.4f}")
+            
+            return filepath
+            
+        except Exception as e:
+            self.logger.error(f"[MULTI-RUN-ERROR] {e}")
+            return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────

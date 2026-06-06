@@ -134,6 +134,17 @@ class SPFBaseController(app_manager.OSKenApp):
         self.metrics_enabled = False
         self.flow_stats_cache = {}  # (dpid, eth_src, eth_dst) -> stats
         
+        # Algorithm timing tracking: (src_mac, dst_mac) -> calculation_time_ms
+        self.algorithm_times = {}
+        
+        # Per-link traffic tracking: (src_dpid, out_port, dst_dpid) -> bytes count
+        # This is populated from switch flow statistics
+        self.link_traffic = defaultdict(int)
+        
+        # Flow to path mapping: (src_mac, dst_mac) -> [(dpid, in_port, out_port), ...]
+        # Used to map flow statistics to links
+        self.flow_paths = {}
+        
         # Periodic flow stats polling
         self.stats_poll_thread = None
         self.stats_poll_interval = 5  # seconds
@@ -159,6 +170,19 @@ class SPFBaseController(app_manager.OSKenApp):
         raise NotImplementedError(
             f"{self.__class__.__name__} must implement compute_path()"
         )
+    
+    def record_algorithm_time(self, src_mac, dst_mac, calculation_time_ms):
+        """Record the algorithm calculation time for a flow.
+        
+        Args:
+            src_mac: Source MAC address
+            dst_mac: Destination MAC address
+            calculation_time_ms: Algorithm execution time in milliseconds
+        """
+        key = (src_mac, dst_mac)
+        self.algorithm_times[key] = calculation_time_ms
+        if self.metrics_collector:
+            self.metrics_collector.record_algorithm_time(src_mac, dst_mac, calculation_time_ms)
 
     def _on_topology_changed(self):
         """Hook called immediately after topology updates.
@@ -227,12 +251,65 @@ class SPFBaseController(app_manager.OSKenApp):
                         'duration_sec': stat.duration_sec
                     }
                     flow_count += 1
+                    
+                    # Extract per-link traffic from this flow's statistics
+                    self._extract_link_traffic_from_flow(dpid, eth_src, eth_dst, stat.byte_count)
             except Exception as e:
                 self.logger.debug(f"[FLOW-STATS-PARSE] {e}")
         
         if flow_count > 0:
             timestamp = datetime.now().strftime("%H:%M:%S")
             self.logger.info(f"[{timestamp}] [STATS-REPLY] s{dpid}: received stats for {flow_count} flows")
+
+    def _extract_link_traffic_from_flow(self, dpid, eth_src, eth_dst, byte_count):
+        """Extract per-link traffic from a flow's statistics.
+        
+        For a flow (eth_src, eth_dst) seen at switch dpid with byte_count bytes,
+        find which link (output port) this flow uses on this switch, and accumulate
+        bytes to that link.
+        
+        Args:
+            dpid: Switch DPID reporting the flow
+            eth_src: Source MAC address
+            eth_dst: Destination MAC address
+            byte_count: Total bytes for this flow (from switch stats)
+        """
+        try:
+            flow_key = (eth_src, eth_dst)
+            
+            # Get the path this flow uses (if known)
+            path = self.flow_paths.get(flow_key)
+            if not path:
+                # Path not yet installed/known
+                return
+            
+            # Find which hop in the path is on this switch
+            for hop_idx, (hop_dpid, in_port, out_port) in enumerate(path):
+                if hop_dpid == dpid:
+                    # Found the hop on this switch
+                    # The output port on this switch is out_port
+                    # The destination switch is the next hop's switch (or host)
+                    
+                    if hop_idx + 1 < len(path):
+                        # There's a next hop - it's a link to another switch
+                        next_hop_dpid = path[hop_idx + 1][0]
+                    else:
+                        # Last hop - ends at a host
+                        next_hop_dpid = None
+                    
+                    # Record this link's traffic
+                    # Link key: (src_switch, out_port, dst_switch)
+                    link_key = (dpid, out_port, next_hop_dpid)
+                    self.link_traffic[link_key] += byte_count
+                    
+                    self.logger.debug(
+                        f"[LINK-TRAFFIC] Flow {eth_src}->{eth_dst} on s{dpid}: "
+                        f"port {out_port} -> s{next_hop_dpid}: +{byte_count} bytes "
+                        f"(total: {self.link_traffic[link_key]})"
+                    )
+                    return
+        except Exception as e:
+            self.logger.debug(f"[LINK-EXTRACT-ERROR] {e}")
 
     def request_flow_stats(self):
         """Request flow statistics from all connected switches."""
@@ -369,6 +446,13 @@ class SPFBaseController(app_manager.OSKenApp):
                     timestamp = datetime.now().strftime("%H:%M:%S")
                     self.logger.info(f"[{timestamp}] [STATS-POLL] Polling {len(self.datapaths)} switch(es)")
                     self.request_flow_stats()
+                    
+                    # Also export collected data periodically if metrics enabled
+                    if self.metrics_enabled and self.metrics_collector:
+                        if self.link_traffic:
+                            self.metrics_collector.save_link_traffic_to_csv()
+                        if self.algorithm_times:
+                            self.metrics_collector.save_algorithm_times_to_csv()
             except Exception as e:
                 self.logger.debug(f"[STATS-POLL-ERROR] {e}")
 
@@ -565,8 +649,22 @@ class SPFBaseController(app_manager.OSKenApp):
             return                          # already installed — no-op
 
         self.installed_paths[key] = path
+        
+        # Store path mapping for later flow statistics correlation
+        self.flow_paths[key] = path
+        
         self.logger.debug("[FLOW-INSTALL] %s → %s: %s", src_mac, dst_mac,
                           self._format_path(path))
+
+        # Track which links are used for this flow
+        for sw, in_port, out_port in path:
+            # Link identified by (src_switch, out_port, dst_switch)
+            # We'll match this when processing flow statistics
+            if len(path) > 1:
+                path_idx = next((i for i, (s, _, _) in enumerate(path) if s == sw), None)
+                if path_idx is not None and path_idx + 1 < len(path):
+                    next_sw = path[path_idx + 1][0]
+                    # This link key will be matched in flow stats processing
 
         for sw, in_port, out_port in path:
             dp = self.datapaths.get(int(sw))
@@ -653,7 +751,13 @@ class SPFBaseController(app_manager.OSKenApp):
                 if not src_loc or not dst_loc:
                     skipped += 1
                     continue
+                
+                # Measure algorithm execution time
+                algo_start = time.time()
                 path = self.compute_path(src_loc[0], dst_loc[0], src_loc[1], dst_loc[1])
+                algo_time_ms = (time.time() - algo_start) * 1000
+                self.record_algorithm_time(src_mac, dst_mac, algo_time_ms)
+                
                 if path:
                     self.install_path(path, src_mac, dst_mac)
                     installed += 1
@@ -723,7 +827,13 @@ class SPFBaseController(app_manager.OSKenApp):
             else:
                 src_sw, src_port = self.mymacs[src]
                 dst_sw, dst_port = self.mymacs[dst]
+                
+                # Measure algorithm execution time
+                algo_start = time.time()
                 p = self.compute_path(src_sw, dst_sw, src_port, dst_port)
+                algo_time_ms = (time.time() - algo_start) * 1000
+                self.record_algorithm_time(src, dst, algo_time_ms)
+                
                 if p:
                     self.install_path(p, src, dst)
                 else:
